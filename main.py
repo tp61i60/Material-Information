@@ -1,27 +1,28 @@
 """
-MOPS 不動產重大訊息爬蟲 v3
+MOPS 不動產重大訊息爬蟲 v4 (API & CLI 雙模式修復版)
 修復項目：
-  1. 加上 `from __future__ import annotations` → 相容 Python 3.8/3.9
-  2. spoke_date 日期比對：統一轉成民國年格式 YYYMMDD（7 位）再比對
-  3. get_date_range() 同時回傳西元與民國格式日期集合
-  4. 移除遺留的 argparse 說明，改以 API 模式為主，保留 main() 供本機測試
-  5. get_detail() 硬編碼欄位改用標題文字比對，降低位置偏移風險
-  6. fetch() 中 throttle_wait / retry_wait 拆成兩個獨立參數
-  7. OUTPUT_FILE 移入 main()，避免模組載入時產生無用常數
+  1. 雙模式啟動：可作為腳本直接產出 CSV，也可作為 FastAPI 伺服器運行。
+  2. onclick 解析退回 V5 強健的字串切割法，避免正則表達式漏抓單引號格式。
+  3. spoke_date 格式比對：自動偵測 7 位民國年或 8 位西元格式，雙軌比對。
+  4. FastAPI async route 改用 run_in_executor 包住阻塞式爬蟲。
 """
-from __future__ import annotations  # ← Fix 1：相容 Python 3.8/3.9
+from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
 import logging
 import socket
+import argparse
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 from urllib.parse import quote
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse
+from concurrent.futures import ThreadPoolExecutor
 
 # ── 設定 ──────────────────────────────────────────────────────────────────────
 
@@ -57,6 +58,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# 全域 thread pool（給 run_in_executor 用）
+_executor = ThreadPoolExecutor(max_workers=1)
+
 
 # ── 主機管理類別 ───────────────────────────────────────────────────────────────
 
@@ -66,9 +70,7 @@ class MopsSession:
     def __init__(self) -> None:
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-        self._active_host: str | None = None  # Fix 1 讓此語法在 3.8 也合法
-
-    # ── 工具方法 ──────────────────────────────────────────────────────────────
+        self._active_host: str | None = None
 
     @staticmethod
     def _is_blocked(html: str) -> bool:
@@ -93,8 +95,6 @@ class MopsSession:
         if len(parts) >= 4:
             return new_host.rstrip("/") + "/" + parts[3]
         return new_host.rstrip("/") + "/" + url
-
-    # ── 主機偵測 ──────────────────────────────────────────────────────────────
 
     def detect_host(self, force: bool = False) -> str:
         if self._active_host and not force:
@@ -133,17 +133,14 @@ class MopsSession:
             "請確認您的 IP 在台灣境內，或使用台灣 VPN/代理伺服器。"
         )
 
-    # ── HTTP 請求（含重試） ────────────────────────────────────────────────────
-    # Fix 6：throttle_wait（限速等待）與 retry_wait（一般錯誤等待）拆開
-
     def fetch(
         self,
         url: str,
         method: str = "GET",
         data: dict | None = None,
         max_retries: int = 5,
-        throttle_wait: int = 60,   # 被限速時等待秒數
-        retry_wait:    int = 10,   # 一般錯誤重試間隔秒數
+        throttle_wait: int = 60,
+        retry_wait:    int = 10,
     ) -> BeautifulSoup | None:
         host = self.detect_host()
 
@@ -179,7 +176,7 @@ class MopsSession:
                     continue
 
                 log.warning("請求失敗（第 %d 次）：%s", attempt + 1, e)
-                time.sleep(retry_wait)  # Fix 6：使用獨立的 retry_wait
+                time.sleep(retry_wait)
 
         log.error("超過重試次數，跳過此項目")
         return None
@@ -188,18 +185,12 @@ class MopsSession:
 # ── 工具函數 ──────────────────────────────────────────────────────────────────
 
 def clean(text: str) -> str:
-    """移除多餘空白"""
     return re.sub(r"\s+", "", text).strip() if text else ""
 
 
 def truncate_instructions(text: str) -> str:
-    """
-    保留重大訊息的前 11 點內容，刪除第 12 點（含）以後的所有文字。
-    支援多種常見格式：半形/全形數字點、中文序號、全型括號。
-    """
     if not text:
         return ""
-
     pattern = r"(?m)^\s*(?:12\s*[\.．、]|（十二）|十二[、．])"
     parts = re.split(pattern, text, maxsplit=1)
     result = parts[0].strip()
@@ -207,16 +198,7 @@ def truncate_instructions(text: str) -> str:
     return result
 
 
-# Fix 2 & 3：get_date_range() 同時回傳民國年格式日期集合供 spoke_date 比對
 def get_date_range(days: int = 7) -> tuple[set, set, set]:
-    """
-    回傳：
-      query_targets    - {(民國年 int, 月 int), ...}  用於組 URL 查詢參數
-      valid_roc_dates  - {'YYYMMDD', ...}              民國年格式，用於比對 spoke_date
-      valid_ad_dates   - {'YYYYMMDD', ...}             西元格式，備用
-
-    MOPS 的 spoke_date 欄位為民國年 7 位格式，例如 1140101。
-    """
     end_dt   = datetime.now()
     start_dt = end_dt - timedelta(days=days)
 
@@ -228,26 +210,47 @@ def get_date_range(days: int = 7) -> tuple[set, set, set]:
 
     query_targets   = {(d.year - 1911, d.month) for d in dates}
     valid_roc_dates = {
-        f"{d.year - 1911:03d}{d.month:02d}{d.day:02d}"   # e.g. 1140404
-        for d in dates
+        f"{d.year - 1911:03d}{d.month:02d}{d.day:02d}" for d in dates
     }
     valid_ad_dates  = {d.strftime("%Y%m%d") for d in dates}
 
     return query_targets, valid_roc_dates, valid_ad_dates
 
 
+def is_date_in_range(spoke_date: str, valid_roc_dates: set, valid_ad_dates: set) -> bool:
+    if not spoke_date:
+        return False
+    if len(spoke_date) == 8:
+        return spoke_date in valid_ad_dates
+    if len(spoke_date) == 7:
+        return spoke_date in valid_roc_dates
+    # 寬鬆比對（取後 6 位月日部分）
+    log.debug("spoke_date 格式未知：%s，嘗試寬鬆比對", spoke_date)
+    for d in valid_ad_dates:
+        if spoke_date.endswith(d[4:]):
+            return True
+    return False
+
+
 # ── 列表頁解析 ────────────────────────────────────────────────────────────────
 
-def get_list_post_params(
-    sess: MopsSession,
-    keyword: str,
-    year: int,
-    month: int,
-) -> list[dict]:
-    """
-    取得搜尋結果列表，回傳各公告的 POST 參數字典。
-    同時抓取上市(L)與上櫃(O)。
-    """
+def _parse_onclick(onclick: str) -> dict:
+    """退回 V5 最穩定的字串切割法，捨棄正則表達式，避免 MOPS 單雙引號混用導致錯誤"""
+    # 移除前綴與所有可能的引號
+    onclick = re.sub(r'document\.fm\.|\.value|["\']', "", onclick)
+    onclick = re.sub(r"openWindow\(.*?\);?", "", onclick)
+    parts = [p.strip() for p in onclick.split(";") if "=" in p.strip()]
+    
+    result = {}
+    for part in parts:
+        k, v = part.split("=", 1)
+        k = k.strip()
+        if k and k not in ("window", "location"):
+            result[k] = v.strip()
+    return result
+
+
+def get_list_post_params(sess: MopsSession, keyword: str, year: int, month: int) -> list[dict]:
     host        = sess.detect_host()
     all_records = []
 
@@ -272,20 +275,17 @@ def get_list_post_params(
                 dates.append(tds[2].get_text().strip())
 
         inputs = soup.select("td input[onclick]")
+        log.debug("  [%s/%s] 找到 %d 個 input 按鈕", kind, keyword, len(inputs))
 
         for i, inp in enumerate(inputs):
-            onclick = inp.get("onclick", "")
-            onclick = re.sub(r'document\.fm\.|\.value|"', "", onclick)
-            onclick = re.sub(r"openWindow\(,\);?", "", onclick)
-            parts   = [p.strip() for p in onclick.split(";") if "=" in p.strip()]
-
-            param_dict: dict = {}
-            for part in parts:
-                k, v = part.split("=", 1)
-                param_dict[k.strip()] = v.strip()
+            onclick    = inp.get("onclick", "")
+            param_dict = _parse_onclick(onclick)
 
             if not param_dict.get("co_id"):
                 continue
+
+            if not param_dict.get("spoke_date") and param_dict.get("date"):
+                param_dict["spoke_date"] = param_dict.pop("date")
 
             param_dict["_check_name"] = names[i] if i < len(names) else ""
             param_dict["_check_date"] = dates[i] if i < len(dates) else ""
@@ -300,12 +300,7 @@ def get_list_post_params(
 # ── 詳細頁解析 ────────────────────────────────────────────────────────────────
 
 def _find_cell_by_header(soup: BeautifulSoup, header_keyword: str) -> str:
-    """
-    Fix 5：以標題文字搜尋對應的 td.odd 欄位值，取代硬編碼 row/col。
-    在同一列中找到含有 header_keyword 的 th 或標籤，回傳緊接著的 td.odd。
-    """
     for tr in soup.select("table tr"):
-        # 找含關鍵字的 th 或 td（非 odd）
         headers = tr.find_all(
             lambda tag: tag.name in ("th", "td")
             and "odd" not in tag.get("class", [])
@@ -319,10 +314,6 @@ def _find_cell_by_header(soup: BeautifulSoup, header_keyword: str) -> str:
 
 
 def get_detail(sess: MopsSession, param_dict: dict, year: int) -> dict | None:
-    """
-    進入詳細頁，抓取公告完整內容。
-    篩選條件：說明本文必須包含「1.標的物之名稱」或關鍵字「委建」。
-    """
     host = sess.detect_host()
     url  = f"{host}/mops/web/ajax_t05st01"
 
@@ -347,7 +338,6 @@ def get_detail(sess: MopsSession, param_dict: dict, year: int) -> dict | None:
     if "查無所需資料" in page_text or "資料庫查無所需資料" in page_text:
         return None
 
-    # ── 說明本文 ──────────────────────────────────────────────────────────────
     instr_el = soup.select_one("tr:nth-of-type(5) td.odd pre")
     if instr_el:
         instructions_raw = instr_el.get_text(separator="\n").strip()
@@ -355,34 +345,30 @@ def get_detail(sess: MopsSession, param_dict: dict, year: int) -> dict | None:
         tds = soup.select("table tr:nth-of-type(5) td.odd")
         instructions_raw = clean(tds[0].get_text()) if tds else ""
 
-    is_real_estate   = "1.標的物之名稱" in instructions_raw
-    is_construction  = "委建" in instructions_raw
+    is_real_estate  = "1.標的物之名稱" in instructions_raw
+    is_construction = "委建" in instructions_raw
     if not (is_real_estate or is_construction):
         return None
 
     instructions_cleaned = truncate_instructions(instructions_raw)
 
-    # ── 主旨 ──────────────────────────────────────────────────────────────────
     subject_el = (
         soup.select_one("tr:nth-of-type(3) td.odd pre font")
         or soup.select_one("tr:nth-of-type(3) td.odd")
     )
     subject = clean(subject_el.get_text()) if subject_el else ""
 
-    # Fix 5：改用標題文字比對，不再依賴硬編碼位置
-    terms           = _find_cell_by_header(soup, "條款")   # 視實際欄位標題調整
+    terms           = _find_cell_by_header(soup, "條款")
     occurrence_date = _find_cell_by_header(soup, "發生日期")
 
-    # 若文字比對找不到，回退到原本位置抓法（保險）
     if not terms or not occurrence_date:
         trs = soup.select("table tr")
         if len(trs) >= 4:
             tds = trs[3].select("td.odd")
             if len(tds) >= 2:
-                terms           = terms or clean(tds[0].get_text())
+                terms           = terms           or clean(tds[0].get_text())
                 occurrence_date = occurrence_date or clean(tds[1].get_text())
 
-    # ── 委建：標題與說明本文均須含「委建」才保留 ──────────────────────────────
     if param_dict.get("_keyword") == "委建":
         if "委建" not in subject or "委建" not in instructions_cleaned:
             return None
@@ -399,21 +385,16 @@ def get_detail(sess: MopsSession, param_dict: dict, year: int) -> dict | None:
     }
 
 
-# ── 共用爬取邏輯（main 與 API 共用） ──────────────────────────────────────────
+# ── 共用爬取邏輯 ───────────────────────────────────────────────────────────────
 
 def run_crawl(days: int = 7) -> list[dict]:
-    """
-    核心爬取流程，回傳結果清單。
-    Fix 2：使用 valid_roc_dates（民國年格式）比對 spoke_date。
-    """
     sess = MopsSession()
     sess.detect_host()
 
     all_results: list[dict] = []
     seen_keys:   set        = set()
 
-    # Fix 3：取得民國年日期集合
-    query_targets, valid_roc_dates, _ = get_date_range(days=days)
+    query_targets, valid_roc_dates, valid_ad_dates = get_date_range(days=days)
     log.info("查詢範圍：過去 %d 天，涵蓋 %d 個年月組合", days, len(query_targets))
 
     for keyword in SEARCH_KEYWORDS:
@@ -428,22 +409,22 @@ def run_crawl(days: int = 7) -> list[dict]:
                 continue
 
             for param_dict in params_list:
-                # Fix 2：比對民國年格式 spoke_date
-                if param_dict.get("spoke_date") not in valid_roc_dates:
+                spoke_date = param_dict.get("spoke_date", "")
+
+                if not is_date_in_range(spoke_date, valid_roc_dates, valid_ad_dates):
                     continue
 
                 dedup_key = (
-                    param_dict["co_id"],
-                    param_dict["spoke_date"],
-                    param_dict["seq_no"],
+                    param_dict.get("co_id", ""),
+                    spoke_date,
+                    param_dict.get("seq_no", ""),
                 )
                 if dedup_key in seen_keys:
                     continue
 
                 log.info(
-                    "  → 抓取 %s (%s)...",
-                    param_dict["co_id"],
-                    param_dict.get("_check_name", ""),
+                    "  → 抓取 %s (%s) spoke_date=%s...",
+                    param_dict.get("co_id"), param_dict.get("_check_name", ""), spoke_date,
                 )
                 time.sleep(SLEEP_SEC)
 
@@ -473,10 +454,7 @@ def _save(results: list, filepath: str) -> None:
         log.warning("無結果，未產生 CSV 檔案")
 
 
-# ── 本機測試入口（Fix 4：移除遺留的 argparse，改為直接帶參數） ─────────────────
-
 def main(days: int = 7) -> None:
-    # Fix 7：OUTPUT_FILE 移入 main()，避免模組載入時產生無用常數
     output_file = f"mops_real_estate_{datetime.now().strftime('%Y%m%d')}.csv"
     results = run_crawl(days=days)
     _save(results, output_file)
@@ -485,21 +463,38 @@ def main(days: int = 7) -> None:
 
 # ── FastAPI 路由 ───────────────────────────────────────────────────────────────
 
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok", "time": datetime.now().isoformat()}
+
 @app.get("/fetch-news")
-async def fetch_news(days: int = Query(default=7, ge=1, le=30)) -> dict:
-    """
-    抓取重大訊息 API（供 n8n 或其他服務呼叫）
-    """
+async def fetch_news(days: int = Query(default=7, ge=1, le=30)) -> JSONResponse:
     try:
-        results = run_crawl(days=days)
-        return {"count": len(results), "data": results}
+        loop    = asyncio.get_event_loop()
+        results = await loop.run_in_executor(_executor, run_crawl, days)
+        return JSONResponse(content={"count": len(results), "data": results})
+    except ConnectionError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
+        log.exception("爬取失敗")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Zeabur / 本機啟動 ─────────────────────────────────────────────────────────
+# ── 啟動邏輯 (支援 CLI 直接產檔 或 啟動 API) ──────────────────────────────────────────
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    parser = argparse.ArgumentParser(description="MOPS 爬蟲 (雙模式)")
+    parser.add_argument("--api", action="store_true", help="啟動 FastAPI 伺服器 (供 n8n / 外部呼叫)")
+    parser.add_argument("--days", type=int, default=7, help="查詢過去幾天的公告 (預設: 7)")
+    args = parser.parse_args()
+
+    if args.api:
+        # 模式 1：啟動伺服器模式 (不會馬上跑，需要去戳 endpoint)
+        import uvicorn
+        port = int(os.environ.get("PORT", 8080))
+        log.info(f"啟動 FastAPI 伺服器... 請用瀏覽器或工具呼叫 http://localhost:{port}/fetch-news")
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    else:
+        # 模式 2：腳本模式 (直接執行並產出 CSV)
+        log.info(f"以腳本模式啟動... 將直接爬取過去 {args.days} 天的資料並儲存 CSV")
+        main(days=args.days)
