@@ -23,6 +23,8 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
 from concurrent.futures import ThreadPoolExecutor
+import urllib3                                                    # ← 新增
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  
 
 # ── 設定 ──────────────────────────────────────────────────────────────────────
 
@@ -67,10 +69,11 @@ _executor = ThreadPoolExecutor(max_workers=1)
 class MopsSession:
     """管理 MOPS HTTP Session 與主機偵測"""
 
-    def __init__(self) -> None:
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-        self._active_host: str | None = None
+def __init__(self) -> None:
+    self.session = requests.Session()
+    self.session.headers.update(HEADERS)
+    self.session.verify = False          # ← 加這行
+    self._active_host: str | None = None
 
     @staticmethod
     def _is_blocked(html: str) -> bool:
