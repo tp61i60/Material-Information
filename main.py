@@ -1,5 +1,5 @@
 """
-MOPS 不動產重大訊息爬蟲 v4版本 (API & CLI 雙模式修復版 )
+MOPS 不動產重大訊息爬蟲 v5版本 (API & CLI 雙模式修復版 )
 修復項目：
   1. 雙模式啟動：可作為腳本直接產出 CSV，也可作為 FastAPI 伺服器運行。
   2. onclick 解析退回 V5 強健的字串切割法，避免正則表達式漏抓單引號格式。
@@ -69,11 +69,11 @@ _executor = ThreadPoolExecutor(max_workers=1)
 class MopsSession:
     """管理 MOPS HTTP Session 與主機偵測"""
 
-def __init__(self) -> None:
-    self.session = requests.Session()
-    self.session.headers.update(HEADERS)
-    self.session.verify = False          # ← 加這行
-    self._active_host: str | None = None
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.session.verify = False          # ← 加這行
+        self._active_host: str | None = None
 
     @staticmethod
     def _is_blocked(html: str) -> bool:
